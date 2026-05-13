@@ -9,6 +9,8 @@ import androidx.compose.animation.core.*
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
@@ -16,12 +18,13 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.foundation.Image
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.font.FontWeight
@@ -35,6 +38,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
 import android.content.Context
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.SpanStyle
@@ -50,8 +54,17 @@ import java.net.Socket
 
 data class ChatMessage(
     val text: String,
-    val role: String,        // "user" | "ai" | "system" | "thinking"
-    val timestamp: String = ""
+    val role: String,        // "user" | "ai" | "system" | "thinking" | "work_exec"
+    val timestamp: String = "",
+    val extra: String = "",  // for work_exec: holds "code|||output"
+    val images: List<String> = emptyList()  // base64 JPEG thumbnails
+)
+
+data class HostFileEntry(
+    val name: String,
+    val path: String,
+    val type: String,   // "file" | "dir"
+    val size: Long = 0L
 )
 
 // ─── Colours ─────────────────────────────────────────────────────────────────
@@ -115,7 +128,8 @@ fun AppRoot() {
     val scope         = rememberCoroutineScope()
 
     // ── Socket references held in state so we can write from input bar ─────
-    var socketWriter  by remember { mutableStateOf<PrintWriter?>(null) }
+    var socketWriter              by remember { mutableStateOf<PrintWriter?>(null) }
+    var clientFileLauncherTrigger by remember { mutableStateOf(0) }
 
     // ── Feature panel state ────────────────────────────────────────────────
     var sessionsOpen      by remember { mutableStateOf(false) }
@@ -144,6 +158,23 @@ fun AppRoot() {
     var manualResponseWorkMode   by remember { mutableStateOf(false) }
     var manualResponseWorkOutput by remember { mutableStateOf("") }
     var manualResponseText       by remember { mutableStateOf("") }
+    // ── Work mode banner ──────────────────────────────────────────────────
+    var workBannerText           by remember { mutableStateOf("") }
+    var workBannerVisible        by remember { mutableStateOf(false) }
+    // ── Host file browser ─────────────────────────────────────────────────
+    var hostBrowserOpen          by remember { mutableStateOf(false) }
+    var hostBrowserPath          by remember { mutableStateOf("") }
+    var hostBrowserParent        by remember { mutableStateOf("") }
+    var hostBrowserEntries       by remember { mutableStateOf<List<HostFileEntry>>(emptyList()) }
+    var hostBrowserSelected      by remember { mutableStateOf<Set<String>>(emptySet()) }
+    // ── Image attach mode dialog ───────────────────────────────────────────
+    var imageAttachDialogFiles   by remember { mutableStateOf<List<String>>(emptyList()) }
+    var imageAttachDialogOpen    by remember { mutableStateOf(false) }
+    var imageAttachChecked       by remember { mutableStateOf<Set<String>>(emptySet()) }
+    // ── Attached image cards mirrored from PC state ────────────────────────
+    var attachedImages           by remember { mutableStateOf<List<Pair<String, Boolean>>>(emptyList()) }
+    var imageThumbMap            by remember { mutableStateOf<Map<String, String>>(emptyMap()) }
+    // Pair: (filePath, sendEveryTime)
 
     // ── Helper: send JSON to PC ────────────────────────────────────────────
     fun sendToPC(cmd: Map<String, Any>) {
@@ -161,7 +192,27 @@ fun AppRoot() {
         when (obj.optString("cmd")) {
             "add_user" -> {
                 val text = obj.optString("text")
-                if (text.isNotBlank()) messages.add(ChatMessage(text, "user"))
+                val imagesArr = obj.optJSONArray("images")
+                val imageList = if (imagesArr != null)
+                    (0 until imagesArr.length()).map { imagesArr.optString(it) }
+                else emptyList()
+                if (text.isNotBlank()) messages.add(ChatMessage(text, "user", images = imageList))
+            }
+            "image_attached" -> {
+                val path      = obj.optString("path", "")
+                val sendEvery = obj.optBoolean("send_every", true)
+                val thumb     = obj.optString("thumb_b64", "")
+                if (path.isNotBlank()) {
+                    if (thumb.isNotBlank()) imageThumbMap = imageThumbMap + (path to thumb)
+                    if (attachedImages.none { it.first == path })
+                        attachedImages = attachedImages + Pair(path, sendEvery)
+                }
+            }
+            "image_detached" -> {
+                val path = obj.optString("path", "")
+                if (path.isNotBlank()) {
+                    attachedImages = attachedImages.filter { it.first != path }
+                }
             }
             "add_ai" -> {
                 val text = obj.optString("text")
@@ -247,6 +298,69 @@ fun AppRoot() {
                 userNameEdit = userName
                 asstNameEdit = asstName
             }
+            "show_work_banner" -> {
+                workBannerText    = obj.optString("text", "Working…")
+                workBannerVisible = true
+            }
+            "hide_work_banner" -> {
+                workBannerVisible = false
+                workBannerText    = ""
+            }
+            "hide_thinking" -> {
+                messages.removeAll { it.role == "thinking" }
+                workBannerVisible = false
+                workBannerText    = ""
+            }
+            "add_work_execution" -> {
+                val code       = obj.optString("code", "")
+                val output     = obj.optString("output", "")
+                val annotation = obj.optString("annotation", "")
+                if (code.isNotBlank()) {
+                    val newMsg = ChatMessage(
+                        text  = "▶ Executed code block",
+                        role  = "work_exec",
+                        extra = "$annotation|||$code|||$output"
+                    )
+                    val thinkingIdx = messages.indexOfFirst { it.role == "thinking" }
+                    if (thinkingIdx >= 0) messages.add(thinkingIdx, newMsg)
+                    else messages.add(newMsg)
+                }
+            }
+            "file_received" -> {
+                val path     = obj.optString("path", "")
+                val filename = obj.optString("filename", "")
+                if (path.isNotBlank()) {
+                    val imageExts = listOf(".jpg",".jpeg",".png",".gif",".bmp",".webp",".jfif")
+                    val isImage   = imageExts.any { filename.lowercase().endsWith(it) }
+                    if (isImage) {
+                        // Accumulate — don't overwrite — so multi-file uploads all appear
+                        imageAttachDialogFiles = imageAttachDialogFiles + path
+                        imageAttachChecked     = imageAttachChecked + path
+                        imageAttachDialogOpen  = true
+                    } else {
+                        val cur = inputText
+                        inputText = if (cur.isBlank()) path else "$cur\n$path"
+                    }
+                }
+            }
+            "images_queued" -> { /* shown as image cards above the input bar */ }
+            "file_list" -> {
+                hostBrowserPath   = obj.optString("current_path", "")
+                hostBrowserParent = obj.optString("parent_path", "")
+                val arr = obj.optJSONArray("entries")
+                val list = mutableListOf<HostFileEntry>()
+                if (arr != null) for (i in 0 until arr.length()) {
+                    val e = arr.optJSONObject(i) ?: continue
+                    list.add(HostFileEntry(
+                        name = e.optString("name"),
+                        path = e.optString("path"),
+                        type = e.optString("type"),
+                        size = e.optLong("size")
+                    ))
+                }
+                hostBrowserEntries = list
+                hostBrowserOpen    = true
+            }
         }
     }
 
@@ -318,12 +432,47 @@ fun AppRoot() {
         if (text.isBlank()) return
         inputText = ""
         sendToPC(mapOf("cmd" to "send_message", "text" to text))
-        scope.launch { listState.animateScrollToItem(messages.lastIndex) }
+        // Remove send-once images after sending; keep send-every-time ones
+        // it.second == true means "send every time" → keep those
+        // it.second == false means "send once" → drop after send
+        attachedImages = attachedImages.filter { (_, sendEvery) -> sendEvery }
+        scope.launch { if (messages.isNotEmpty()) listState.animateScrollToItem(messages.lastIndex) }
     }
 
-    // ── Scroll to bottom on new messages ──────────────────────────────────
+    // ── Scroll to bottom on new messages ──────────────────────────────
     LaunchedEffect(messages.size) {
         if (messages.isNotEmpty()) listState.animateScrollToItem(messages.lastIndex)
+    }
+
+    // ── Client file picker launcher ───────────────────────────────────
+    val clientFileLauncher = rememberLauncherForActivityResult(
+        contract = androidx.activity.result.contract.ActivityResultContracts.GetMultipleContents()
+    ) { uris ->
+        uris.forEach { uri ->
+            scope.launch(Dispatchers.IO) {
+                try {
+                    val cr = context.contentResolver
+                    val mime = cr.getType(uri) ?: "application/octet-stream"
+                    // Resolve filename
+                    var filename = "file"
+                    cr.query(uri, null, null, null, null)?.use { c ->
+                        val idx = c.getColumnIndex(android.provider.OpenableColumns.DISPLAY_NAME)
+                        if (idx >= 0 && c.moveToFirst()) filename = c.getString(idx) ?: "file"
+                    }
+                    val bytes = cr.openInputStream(uri)?.readBytes() ?: return@launch
+                    val b64 = android.util.Base64.encodeToString(bytes, android.util.Base64.NO_WRAP)
+                    sendToPC(mapOf("cmd" to "upload_file", "filename" to filename,
+                        "data" to b64, "mime" to mime))
+                } catch (e: Exception) {
+                    withContext(Dispatchers.Main) {
+                        messages.add(ChatMessage("Upload failed: ${e.message}", "system"))
+                    }
+                }
+            }
+        }
+    }
+    LaunchedEffect(clientFileLauncherTrigger) {
+        if (clientFileLauncherTrigger > 0) clientFileLauncher.launch("*/*")
     }
 
     // ── UI ────────────────────────────────────────────────────────────────
@@ -350,12 +499,38 @@ fun AppRoot() {
                 items(messages) { msg -> MessageBubble(msg) }
             }
 
+            // Work mode banner
+            if (workBannerVisible) {
+                WorkModeBanner()
+            }
+
+            // Attached images strip
+            AttachedImagesStrip(
+                images   = attachedImages,
+                onRemove = { path ->
+                    attachedImages = attachedImages.filter { it.first != path }
+                    sendToPC(mapOf("cmd" to "detach_image_path", "path" to path))
+                },
+                onToggle = { path ->
+                    attachedImages = attachedImages.map {
+                        if (it.first == path) Pair(it.first, !it.second) else it
+                    }
+                }
+            )
+
             // Input bar
             InputBar(
-                value     = inputText,
-                onChange  = { inputText = it },
-                onSend    = ::sendMessage,
-                enabled   = connState == ConnState.CONNECTED
+                value          = inputText,
+                onChange       = { inputText = it },
+                onSend         = ::sendMessage,
+                enabled        = connState == ConnState.CONNECTED,
+                onAttachClient = {
+                    // Will be wired via launcher below — trigger via flag
+                    clientFileLauncherTrigger++
+                },
+                onAttachHost   = {
+                    sendToPC(mapOf("cmd" to "browse_files", "path" to ""))
+                }
             )
         }
 
@@ -449,6 +624,80 @@ fun AppRoot() {
                 onReject  = {
                     sendToPC(mapOf("cmd" to "code_approval_result", "approved" to false, "modified_code" to ""))
                     codeApprovalOpen = false
+                }
+            )
+        }
+        if (hostBrowserOpen) {
+            HostFileBrowserPanel(
+                currentPath = hostBrowserPath,
+                parentPath  = hostBrowserParent,
+                entries     = hostBrowserEntries,
+                selected    = hostBrowserSelected,
+                onNavigate  = { path ->
+                    sendToPC(mapOf("cmd" to "browse_files", "path" to path))
+                },
+                onToggleSelect = { path ->
+                    hostBrowserSelected = if (path in hostBrowserSelected)
+                        hostBrowserSelected - path
+                    else
+                        hostBrowserSelected + path
+                },
+                onSelectAll   = { hostBrowserSelected = hostBrowserEntries.filter { it.type == "file" }.map { it.path }.toSet() },
+                onUnselectAll = { hostBrowserSelected = emptySet() },
+                onConfirm = {
+                    val imageExts = listOf(".jpg",".jpeg",".png",".gif",".bmp",".webp",".jfif")
+                    val images    = hostBrowserSelected.filter { p -> imageExts.any { p.lowercase().endsWith(it) } }
+                    val others    = hostBrowserSelected.filter { p -> images.none { it == p } }
+                    if (images.isNotEmpty()) {
+                        imageAttachDialogFiles = images.toList()
+                        imageAttachChecked     = images.toSet()
+                        imageAttachDialogOpen  = true
+                    }
+                    val cur = inputText
+                    val paths = others.joinToString("\n")
+                    if (paths.isNotBlank()) inputText = if (cur.isBlank()) paths else "$cur\n$paths"
+                    hostBrowserOpen     = false
+                    hostBrowserSelected = emptySet()
+                },
+                onClose = { hostBrowserOpen = false; hostBrowserSelected = emptySet() }
+            )
+        }
+        if (imageAttachDialogOpen) {
+            ImageAttachDialog(
+                files         = imageAttachDialogFiles,
+                checkedFiles  = imageAttachChecked,
+                onToggle      = { path ->
+                    imageAttachChecked = if (path in imageAttachChecked)
+                        imageAttachChecked - path
+                    else
+                        imageAttachChecked + path
+                },
+                onSelectAll   = { imageAttachChecked = imageAttachDialogFiles.toSet() },
+                onUnselectAll = { imageAttachChecked = emptySet() },
+                onAttachAsImage = {
+                    val selected = imageAttachDialogFiles.filter { it in imageAttachChecked }
+                    if (selected.isNotEmpty()) {
+                        sendToPC(mapOf("cmd" to "attach_image_path", "paths" to selected))
+                        // Mirror: track locally to show the card strip above input
+                        attachedImages = attachedImages + selected.map { Pair(it, true) }
+                    }
+                    imageAttachDialogFiles = emptyList()
+                    imageAttachChecked     = emptySet()
+                    imageAttachDialogOpen  = false
+                },
+                onAttachAsPath = {
+                    val selected = imageAttachDialogFiles.filter { it in imageAttachChecked }
+                    val cur = inputText
+                    val paths = selected.joinToString("\n")
+                    inputText = if (cur.isBlank()) paths else "$cur\n$paths"
+                    imageAttachDialogFiles = emptyList()
+                    imageAttachChecked     = emptySet()
+                    imageAttachDialogOpen  = false
+                },
+                onCancel = {
+                    imageAttachDialogFiles = emptyList()
+                    imageAttachChecked     = emptySet()
+                    imageAttachDialogOpen  = false
                 }
             )
         }
@@ -1193,15 +1442,22 @@ fun ManualResponsePhonePanel(
 @Composable
 fun MessageBubble(message: ChatMessage) {
     when (message.role) {
-        "user"     -> UserBubble(message.text)
-        "ai"       -> AIBubble(message.text)
-        "system"   -> SystemBubble(message.text)
-        "thinking" -> ThinkingBubble()
+        "user"      -> UserBubble(message.text, message.images)
+        "ai"        -> AIBubble(message.text)
+        "system"    -> SystemBubble(message.text)
+        "thinking"  -> ThinkingBubble()
+        "work_exec" -> {
+            val parts      = message.extra.split("|||", limit = 3)
+            val annotation = parts.getOrElse(0) { "" }
+            val code       = parts.getOrElse(1) { "" }
+            val output     = parts.getOrElse(2) { "" }
+            WorkExecBubble(annotation = annotation, code = code, output = output)
+        }
     }
 }
 
 @Composable
-fun UserBubble(text: String) {
+fun UserBubble(text: String, images: List<String> = emptyList()) {
     Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
         Column(
             horizontalAlignment = Alignment.End,
@@ -1224,11 +1480,50 @@ fun UserBubble(text: String) {
                         .background(C.SentBubble)
                         .padding(horizontal = 16.dp, vertical = 11.dp)
                 ) {
-                    Text(
-                        text       = parseMarkdown(text, C.Text),
-                        fontSize   = 15.sp,
-                        lineHeight = 23.sp
-                    )
+                    if (images.isNotEmpty()) {
+                        val thumbRow = @Composable {
+                            Row(
+                                modifier = Modifier.padding(bottom = 6.dp),
+                                horizontalArrangement = Arrangement.spacedBy(6.dp)
+                            ) {
+                                images.forEach { b64 ->
+                                    val bmp = remember(b64) {
+                                        runCatching {
+                                            val bytes = android.util.Base64.decode(b64, android.util.Base64.DEFAULT)
+                                            android.graphics.BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+                                                ?.asImageBitmap()
+                                        }.getOrNull()
+                                    }
+                                    if (bmp != null) {
+                                        Image(
+                                            bitmap = bmp,
+                                            contentDescription = null,
+                                            contentScale = androidx.compose.ui.layout.ContentScale.Crop,
+                                            modifier = Modifier
+                                                .size(64.dp)
+                                                .clip(RoundedCornerShape(8.dp))
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                        Column(modifier = Modifier.padding(horizontal = 16.dp, vertical = 11.dp)) {
+                            thumbRow()
+                            Text(
+                                text       = parseMarkdown(text, C.Text),
+                                fontSize   = 15.sp,
+                                lineHeight = 23.sp
+                            )
+                        }
+                    } else {
+                        Box(modifier = Modifier.padding(horizontal = 16.dp, vertical = 11.dp)) {
+                            Text(
+                                text       = parseMarkdown(text, C.Text),
+                                fontSize   = 15.sp,
+                                lineHeight = 23.sp
+                            )
+                        }
+                    }
                 }
             }
             Spacer(modifier = Modifier.height(4.dp))
@@ -1431,10 +1726,12 @@ fun parseMarkdown(text: String, baseColor: Color): AnnotatedString = buildAnnota
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun InputBar(
-    value:   String,
-    onChange:(String) -> Unit,
-    onSend:  () -> Unit,
-    enabled: Boolean
+    value:          String,
+    onChange:       (String) -> Unit,
+    onSend:         () -> Unit,
+    enabled:        Boolean,
+    onAttachClient: () -> Unit = {},
+    onAttachHost:   () -> Unit = {}
 ) {
     val hasText = value.isNotBlank()
 
@@ -1455,13 +1752,40 @@ fun InputBar(
                 ),
             verticalAlignment = Alignment.Bottom
         ) {
+            // Attachment button
+            if (enabled) {
+                var attachMenuOpen by remember { mutableStateOf(false) }
+                Box {
+                    IconButton(
+                        onClick  = { attachMenuOpen = true },
+                        modifier = Modifier.size(42.dp)
+                    ) {
+                        Text("📎", fontSize = 18.sp)
+                    }
+                    DropdownMenu(
+                        expanded        = attachMenuOpen,
+                        onDismissRequest = { attachMenuOpen = false },
+                        modifier = Modifier.background(Color(0xFF1A1A1A))
+                    ) {
+                        DropdownMenuItem(
+                            text = { Text("📤  Upload a file (Client)", color = C.Text, fontSize = 13.sp) },
+                            onClick = { attachMenuOpen = false; onAttachClient() }
+                        )
+                        DropdownMenuItem(
+                            text = { Text("🗂  Choose a file (Host)", color = C.Text, fontSize = 13.sp) },
+                            onClick = { attachMenuOpen = false; onAttachHost() }
+                        )
+                    }
+                }
+            }
+
             TextField(
                 value         = value,
                 onValueChange = onChange,
                 enabled       = enabled,
                 modifier      = Modifier
                     .weight(1f)
-                    .padding(start = 6.dp),
+                    .padding(start = if (enabled) 0.dp else 6.dp),
                 placeholder   = {
                     Text(
                         text     = if (enabled) "Message…" else "Connect to PC to chat",
@@ -1517,6 +1841,521 @@ fun InputBar(
             // Placeholder spacer so height doesn't jump when button appears
             if (!hasText || !enabled) {
                 Spacer(modifier = Modifier.size(50.dp))
+            }
+        }
+    }
+}
+
+// ─── Work Mode Banner ────────────────────────────────────────────────────────
+
+@Composable
+fun WorkModeBanner() {
+    val infiniteTransition = rememberInfiniteTransition(label = "workbanner")
+    val alpha1 by infiniteTransition.animateFloat(
+        initialValue = 0.2f, targetValue = 1f,
+        animationSpec = infiniteRepeatable(tween(600, easing = FastOutSlowInEasing), RepeatMode.Reverse),
+        label = "wb1"
+    )
+    val alpha2 by infiniteTransition.animateFloat(
+        initialValue = 0.2f, targetValue = 1f,
+        animationSpec = infiniteRepeatable(tween(600, 200, FastOutSlowInEasing), RepeatMode.Reverse),
+        label = "wb2"
+    )
+    val alpha3 by infiniteTransition.animateFloat(
+        initialValue = 0.2f, targetValue = 1f,
+        animationSpec = infiniteRepeatable(tween(600, 400, FastOutSlowInEasing), RepeatMode.Reverse),
+        label = "wb3"
+    )
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .background(C.Bg)
+            .padding(vertical = 10.dp),
+        horizontalArrangement = Arrangement.Center,
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        listOf(alpha1, alpha2, alpha3).forEach { a ->
+            Box(
+                modifier = Modifier
+                    .size(7.dp)
+                    .clip(CircleShape)
+                    .background(Color(0xFFAAAAAA).copy(alpha = a))
+            )
+            Spacer(modifier = Modifier.width(6.dp))
+        }
+    }
+}
+
+// ─── Work Execution Bubble ───────────────────────────────────────────────────
+
+@Composable
+fun WorkExecBubble(annotation: String, code: String, output: String) {
+    var expanded by remember { mutableStateOf(false) }
+
+    // Extract first-line tags (e.g. "import x, y" → chip)
+    val tags = code.lines()
+        .take(3)
+        .filter { it.trimStart().startsWith("import ") || it.trimStart().startsWith("from ") }
+        .map { it.trim().removePrefix("import ").removePrefix("from ").take(40) }
+
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 4.dp, vertical = 4.dp)
+            .clip(RoundedCornerShape(10.dp))
+            .background(Color(0xFF161B22))
+    ) {
+        // ── Header bar ─────────────────────────────────────────────────────
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .background(C.Surface)
+                .padding(horizontal = 12.dp, vertical = 8.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Text("⚙", fontSize = 12.sp)
+            Spacer(Modifier.width(6.dp))
+
+            // Annotation text
+            Text(
+                text       = if (annotation.isNotBlank()) annotation else "Code executed",
+                color      = C.TextDim,
+                fontSize   = 11.sp,
+                fontWeight = FontWeight.SemiBold,
+                modifier   = Modifier.weight(1f),
+                maxLines   = 1
+            )
+
+            // Spacer then hide/show toggle
+            Spacer(Modifier.width(6.dp))
+            Box(
+                modifier = Modifier
+                    .clip(RoundedCornerShape(5.dp))
+                    .background(C.InputBg)
+                    .clickable { expanded = !expanded }
+                    .padding(horizontal = 8.dp, vertical = 3.dp)
+            ) {
+                Text(
+                    text     = if (expanded) "Hide" else "Show",
+                    color    = C.SubText,
+                    fontSize = 10.sp
+                )
+            }
+        }
+
+        // ── Import / tag chips row ─────────────────────────────────────────
+        if (tags.isNotEmpty()) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .background(Color(0xFF161B22))
+                    .horizontalScroll(rememberScrollState())
+                    .padding(horizontal = 12.dp, vertical = 5.dp),
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                verticalAlignment     = Alignment.CenterVertically
+            ) {
+                tags.forEach { tag ->
+                    Box(
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(4.dp))
+                            .background(C.InputBg)
+                            .padding(horizontal = 7.dp, vertical = 3.dp)
+                    ) {
+                        Text(
+                            text       = tag,
+                            color      = C.TextDim,
+                            fontSize   = 10.sp,
+                            fontFamily = FontFamily.Monospace
+                        )
+                    }
+                }
+            }
+        }
+
+        // ── Collapsible body ───────────────────────────────────────────────
+        AnimatedVisibility(visible = expanded) {
+            Column {
+                // CODE block
+                if (code.isNotBlank()) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .background(Color(0xFF0D1117))
+                            .padding(horizontal = 12.dp, vertical = 5.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Box(
+                            modifier = Modifier
+                                .size(6.dp)
+                                .clip(CircleShape)
+                                .background(Color(0xFFFF5C5C))
+                        )
+                        Spacer(Modifier.width(4.dp))
+                        Box(
+                            modifier = Modifier
+                                .size(6.dp)
+                                .clip(CircleShape)
+                                .background(Color(0xFFFFC107))
+                        )
+                        Spacer(Modifier.width(4.dp))
+                        Box(
+                            modifier = Modifier
+                                .size(6.dp)
+                                .clip(CircleShape)
+                                .background(Color(0xFF4CD780))
+                        )
+                        Spacer(Modifier.width(8.dp))
+                        Text(
+                            text     = "script",
+                            color    = Color(0xFF444C56),
+                            fontSize = 10.sp,
+                            fontFamily = FontFamily.Monospace
+                        )
+                    }
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .background(Color(0xFF0D1117))
+                            .horizontalScroll(rememberScrollState())
+                            .padding(horizontal = 14.dp, vertical = 10.dp)
+                    ) {
+                        Text(
+                            text       = code,
+                            color      = Color(0xFFE6EDF3),
+                            fontSize   = 11.sp,
+                            fontFamily = FontFamily.Monospace,
+                            lineHeight = 17.sp,
+                            softWrap   = false
+                        )
+                    }
+                }
+
+                // STDOUT / STDERR block
+                if (output.isNotBlank()) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .background(Color(0xFF0A0F15))
+                            .padding(horizontal = 12.dp, vertical = 5.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            text       = "STDOUT:",
+                            color      = Color(0xFF4CD780),
+                            fontSize   = 10.sp,
+                            fontFamily = FontFamily.Monospace,
+                            fontWeight = FontWeight.Bold
+                        )
+                    }
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(bottomStart = 10.dp, bottomEnd = 10.dp))
+                            .background(Color(0xFF0A0F15))
+                            .horizontalScroll(rememberScrollState())
+                            .padding(horizontal = 14.dp, vertical = 8.dp)
+                    ) {
+                        Text(
+                            text       = output,
+                            color      = Color(0xFF8FBC8F),
+                            fontSize   = 11.sp,
+                            fontFamily = FontFamily.Monospace,
+                            lineHeight = 17.sp,
+                            softWrap   = false
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ─── Attached Images Strip ────────────────────────────────────────────────────
+
+@Composable
+fun AttachedImagesStrip(
+    images:        List<Pair<String, Boolean>>,
+    imageThumbMap: Map<String, String> = emptyMap(),
+    onRemove:      (String) -> Unit,
+    onToggle:      (String) -> Unit
+) {
+    if (images.isEmpty()) return
+
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .background(C.Bg)
+            .horizontalScroll(rememberScrollState())
+            .padding(horizontal = 12.dp, vertical = 6.dp),
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+        verticalAlignment     = Alignment.CenterVertically
+    ) {
+        images.forEach { (path, sendEvery) ->
+            val name = path.substringAfterLast('\\')
+                .let { if (it.isNotBlank()) it else path.substringAfterLast('/') }
+                .take(22)
+
+            Row(
+                modifier = Modifier
+                    .clip(RoundedCornerShape(10.dp))
+                    .background(C.InputBg)
+                    .padding(horizontal = 10.dp, vertical = 8.dp),
+                verticalAlignment     = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
+                // Thumbnail — decode b64 if available, else show placeholder
+                val thumbB64 = imageThumbMap[path]
+                if (thumbB64 != null) {
+                    val bmp = remember(thumbB64) {
+                        runCatching {
+                            val bytes = android.util.Base64.decode(thumbB64, android.util.Base64.DEFAULT)
+                            android.graphics.BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+                                ?.asImageBitmap()
+                        }.getOrNull()
+                    }
+                    Box(
+                        modifier = Modifier
+                            .size(34.dp)
+                            .clip(RoundedCornerShape(6.dp))
+                            .background(Color(0x221F6FEB))
+                    ) {
+                        if (bmp != null) {
+                            Image(
+                                bitmap = bmp,
+                                contentDescription = null,
+                                contentScale = androidx.compose.ui.layout.ContentScale.Crop,
+                                modifier = Modifier.fillMaxSize().clip(RoundedCornerShape(6.dp))
+                            )
+                        } else {
+                            Text("🖼", fontSize = 15.sp, modifier = Modifier.align(Alignment.Center))
+                        }
+                    }
+                } else {
+                    Box(
+                        modifier = Modifier
+                            .size(34.dp)
+                            .clip(RoundedCornerShape(6.dp))
+                            .background(Color(0x221F6FEB)),
+                        contentAlignment = Alignment.Center
+                    ) { Text("🖼", fontSize = 15.sp) }
+                }
+
+                Column(modifier = Modifier.widthIn(max = 110.dp)) {
+                    Text(name,  color = C.Text,   fontSize = 10.sp, maxLines = 1)
+                    Text(
+                        text     = if (sendEvery) "🔁 every msg" else "1️⃣ send once",
+                        color    = C.Accent,
+                        fontSize = 9.sp
+                    )
+                }
+
+                // Toggle send-once ↔ send-every
+                Box(
+                    modifier = Modifier
+                        .size(26.dp)
+                        .clip(RoundedCornerShape(6.dp))
+                        .background(C.Surface)
+                        .clickable { onToggle(path) },
+                    contentAlignment = Alignment.Center
+                ) { Text(if (sendEvery) "🔁" else "1️⃣", fontSize = 11.sp) }
+
+                // Remove
+                Box(
+                    modifier = Modifier
+                        .size(22.dp)
+                        .clip(RoundedCornerShape(5.dp))
+                        .background(Color(0x22FF5C5C))
+                        .clickable { onRemove(path) },
+                    contentAlignment = Alignment.Center
+                ) { Text("✕", color = C.Offline, fontSize = 10.sp, fontWeight = FontWeight.Bold) }
+            }
+        }
+    }
+}
+
+// ─── Host File Browser Panel ─────────────────────────────────────────────────
+
+@Composable
+fun HostFileBrowserPanel(
+    currentPath:    String,
+    parentPath:     String,
+    entries:        List<HostFileEntry>,
+    selected:       Set<String>,
+    onNavigate:     (String) -> Unit,
+    onToggleSelect: (String) -> Unit,
+    onSelectAll:    () -> Unit,
+    onUnselectAll:  () -> Unit,
+    onConfirm:      () -> Unit,
+    onClose:        () -> Unit
+) {
+    FeaturePanelShell("🗂  Host Files", onClose) {
+        // Path bar
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .background(Color(0xFF111111))
+                .padding(horizontal = 12.dp, vertical = 6.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            if (currentPath.isNotBlank()) {
+                TextButton(onClick = { onNavigate(parentPath) }) {
+                    Text(
+                        text  = if (parentPath.isBlank()) "◀ Drives" else "◀ Up",
+                        color = C.Accent,
+                        fontSize = 12.sp
+                    )
+                }
+            }
+            Text(
+                text     = currentPath.takeLast(50),
+                color    = C.SubText,
+                fontSize = 10.sp,
+                modifier = Modifier.weight(1f).padding(start = 4.dp)
+            )
+        }
+
+        // Select all / none
+        Row(
+            modifier = Modifier.padding(horizontal = 12.dp, vertical = 4.dp),
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            TextButton(onClick = onSelectAll) { Text("Select All files", color = C.Accent, fontSize = 11.sp) }
+            TextButton(onClick = onUnselectAll) { Text("Unselect All", color = C.SubText, fontSize = 11.sp) }
+        }
+
+        LazyColumn(modifier = Modifier.weight(1f).padding(horizontal = 8.dp)) {
+            if (entries.isEmpty()) {
+                item { Text("Empty directory.", color = C.SubText, fontSize = 13.sp, modifier = Modifier.padding(12.dp)) }
+            }
+            items(entries) { entry ->
+                val isDir      = entry.type == "dir"
+                val isSelected = entry.path in selected
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(vertical = 2.dp)
+                        .clip(RoundedCornerShape(8.dp))
+                        .background(if (isSelected) Color(0xFF1E2A3A) else C.InputBg)
+                        .clickable {
+                            if (isDir) onNavigate(entry.path)
+                            else onToggleSelect(entry.path)
+                        }
+                        .padding(horizontal = 12.dp, vertical = 10.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(if (isDir) "📁" else "📄", fontSize = 14.sp)
+                    Spacer(Modifier.width(8.dp))
+                    Text(entry.name, color = if (isDir) Color(0xFFBFC7D5) else C.Text, fontSize = 13.sp, modifier = Modifier.weight(1f))
+                    if (isSelected) Text("✓", color = C.Accent, fontSize = 13.sp)
+                }
+            }
+        }
+
+        // Confirm
+        val selCount = selected.size
+        Button(
+            onClick  = onConfirm,
+            enabled  = selCount > 0,
+            modifier = Modifier.fillMaxWidth().padding(12.dp),
+            colors   = ButtonDefaults.buttonColors(
+                containerColor         = C.Accent,
+                disabledContainerColor = C.SubText
+            ),
+            shape = RoundedCornerShape(10.dp)
+        ) {
+            Text(if (selCount > 0) "Attach $selCount file(s)" else "Select files to attach", color = Color.White)
+        }
+    }
+}
+
+// ─── Image Attach Dialog ─────────────────────────────────────────────────────
+
+@Composable
+fun ImageAttachDialog(
+    files:           List<String>,
+    checkedFiles:    Set<String>,
+    onToggle:        (String) -> Unit,
+    onSelectAll:     () -> Unit,
+    onUnselectAll:   () -> Unit,
+    onAttachAsImage: () -> Unit,
+    onAttachAsPath:  () -> Unit,
+    onCancel:        () -> Unit
+) {
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(Color(0xCC000000)),
+        contentAlignment = Alignment.Center
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth(0.92f)
+                .clip(RoundedCornerShape(16.dp))
+                .background(Color(0xFF111111))
+                .padding(16.dp)
+        ) {
+            Text(
+                "Attach Image(s)",
+                color      = C.Text,
+                fontSize   = 15.sp,
+                fontWeight = FontWeight.Bold
+            )
+            Spacer(Modifier.height(6.dp))
+            Text("Select which images to attach and how:", color = C.SubText, fontSize = 12.sp)
+            Spacer(Modifier.height(10.dp))
+
+            // Select all / none
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                TextButton(onClick = onSelectAll) { Text("Select All", color = C.Accent, fontSize = 11.sp) }
+                TextButton(onClick = onUnselectAll) { Text("Unselect All", color = C.SubText, fontSize = 11.sp) }
+            }
+
+            // File checkboxes
+            val scrollState = rememberLazyListState()
+            LazyColumn(
+                state    = scrollState,
+                modifier = Modifier.heightIn(max = 240.dp)
+            ) {
+                items(files) { path ->
+                    val checked = path in checkedFiles
+                    val name    = path.substringAfterLast('/').substringAfterLast('\\')
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(vertical = 3.dp)
+                            .clip(RoundedCornerShape(8.dp))
+                            .background(if (checked) Color(0xFF1E2A3A) else C.InputBg)
+                            .clickable { onToggle(path) }
+                            .padding(horizontal = 12.dp, vertical = 10.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(if (checked) "☑" else "☐", color = C.Accent, fontSize = 16.sp)
+                        Spacer(Modifier.width(10.dp))
+                        Text(name, color = C.Text, fontSize = 13.sp, modifier = Modifier.weight(1f))
+                    }
+                }
+            }
+
+            Spacer(Modifier.height(12.dp))
+
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
+                Button(
+                    onClick  = onAttachAsImage,
+                    enabled  = checkedFiles.isNotEmpty(),
+                    modifier = Modifier.weight(1f),
+                    colors   = ButtonDefaults.buttonColors(containerColor = Color(0xFF1F6FEB)),
+                    shape    = RoundedCornerShape(10.dp)
+                ) { Text("🖼 As Image", color = Color.White, fontSize = 12.sp) }
+                Button(
+                    onClick  = onAttachAsPath,
+                    enabled  = checkedFiles.isNotEmpty(),
+                    modifier = Modifier.weight(1f),
+                    colors   = ButtonDefaults.buttonColors(containerColor = C.InputBg),
+                    shape    = RoundedCornerShape(10.dp)
+                ) { Text("📄 As Path", color = C.Text, fontSize = 12.sp) }
+                TextButton(onClick = onCancel) {
+                    Text("Cancel", color = C.SubText, fontSize = 12.sp)
+                }
             }
         }
     }
