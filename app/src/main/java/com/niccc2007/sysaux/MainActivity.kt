@@ -506,7 +506,8 @@ fun AppRoot() {
 
             // Attached images strip
             AttachedImagesStrip(
-                images   = attachedImages,
+                images        = attachedImages,
+                imageThumbMap = imageThumbMap,
                 onRemove = { path ->
                     attachedImages = attachedImages.filter { it.first != path }
                     sendToPC(mapOf("cmd" to "detach_image_path", "path" to path))
